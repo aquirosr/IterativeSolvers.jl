@@ -34,6 +34,7 @@ mutable struct GMRESIterable{preclT, precrT, solT, rhsT, vecT, arnoldiT <: Arnol
     x::solT
     b::rhsT
     Ax::vecT # Some room to work in.
+    ns::vecT # Nullspace of A
 
     arnoldi::arnoldiT
     residual::residualT
@@ -61,7 +62,7 @@ function iterate(g::GMRESIterable, iteration::Int=start(g))
     end
 
     # Arnoldi step: expand
-    expand!(g.arnoldi, g.Pl, g.Pr, g.k, g.Ax)
+    expand!(g.arnoldi, g.Pl, g.Pr, g.k, g.A, g.ns)
     g.mv_products += 1
 
     # Orthogonalize V[:, k + 1] w.r.t. V[:, 1 : k]
@@ -93,7 +94,7 @@ function iterate(g::GMRESIterable, iteration::Int=start(g))
         if !done(g, iteration)
 
             # Set the first basis vector
-            g.β = init!(g.arnoldi, g.x, g.b, g.Pl, g.Ax)
+            g.β = init!(g.arnoldi, g.x, g.b, g.Pl, g.Ax, g.ns)
 
             # And initialize the residual
             init_residual!(g.residual, g.β)
@@ -113,7 +114,8 @@ function gmres_iterable!(x, A, b;
                          restart::Int = min(20, size(A, 2)),
                          maxiter::Int = size(A, 2),
                          initially_zero::Bool = false,
-                         orth_meth::OrthogonalizationMethod = ModifiedGramSchmidt())
+                         orth_meth::OrthogonalizationMethod = ModifiedGramSchmidt(),
+                         ns = zeros(size(b)))
     T = eltype(x)
 
     # Approximate solution
@@ -123,12 +125,12 @@ function gmres_iterable!(x, A, b;
 
     # Workspace vector to reduce the # allocs.
     Ax = similar(x)
-    residual.current = init!(arnoldi, x, b, Pl, Ax, initially_zero = initially_zero)
+    residual.current = init!(arnoldi, x, b, Pl, Ax, ns, initially_zero = initially_zero)
     init_residual!(residual, residual.current)
 
     tolerance = max(reltol * residual.current, abstol)
 
-    GMRESIterable(Pl, Pr, x, b, Ax,
+    GMRESIterable(Pl, Pr, x, b, Ax, ns,
         arnoldi, residual,
         mv_products, restart, 1, maxiter, tolerance, residual.current,
         orth_meth
@@ -191,7 +193,8 @@ function gmres!(x, A, b;
                 log::Bool = false,
                 initially_zero::Bool = false,
                 verbose::Bool = false,
-                orth_meth::OrthogonalizationMethod = ModifiedGramSchmidt())
+                orth_meth::OrthogonalizationMethod = ModifiedGramSchmidt(),
+                ns = zeros(size(b)))
     history = ConvergenceHistory(partial = !log, restart = restart)
     history[:abstol] = abstol
     history[:reltol] = reltol
@@ -200,7 +203,7 @@ function gmres!(x, A, b;
     iterable = gmres_iterable!(x, A, b; Pl = Pl, Pr = Pr,
                                abstol = abstol, reltol = reltol, maxiter = maxiter,
                                restart = restart, initially_zero = initially_zero,
-                               orth_meth = orth_meth)
+                               orth_meth = orth_meth, ns = ns)
 
     verbose && @printf("=== gmres ===\n%4s\t%4s\t%7s\n","rest","iter","resnorm")
 
@@ -232,7 +235,7 @@ function update_residual!(r::Residual, arnoldi::ArnoldiDecomp, k::Int)
     end
 end
 
-function init!(arnoldi::ArnoldiDecomp{T}, x, b, Pl, Ax; initially_zero::Bool = false) where {T}
+function init!(arnoldi::ArnoldiDecomp{T}, x, b, Pl, Ax, ns; initially_zero::Bool = false) where {T}
     # Initialize the Krylov subspace with the initial residual vector
     # This basically does V[1] = Pl \ (b - A * x) and then normalize
 
@@ -247,6 +250,7 @@ function init!(arnoldi::ArnoldiDecomp{T}, x, b, Pl, Ax; initially_zero::Bool = f
     end
 
     ldiv!(Pl, first_col)
+    first_col .*= (1. .- ns)
 
     # Normalize
     β = norm(first_col)
@@ -282,23 +286,27 @@ function update_solution!(x, y, arnoldi::ArnoldiDecomp{T}, Pr, k::Int, Ax) where
     x .+= Ax
 end
 
-function expand!(arnoldi::ArnoldiDecomp, Pl::Identity, Pr::Identity, k::Int, Ax)
+function expand!(arnoldi::ArnoldiDecomp, Pl::Identity, Pr::Identity, k::Int, Ax, ns)
     # Simply expands by A * v without allocating
-    mul!(view(arnoldi.V, :, k + 1), arnoldi.A, view(arnoldi.V, :, k))
+    nextV = view(arnoldi.V, :, k + 1)
+    mul!(nextV, arnoldi.A, view(arnoldi.V, :, k))
+    nextV .*= 1. .- ns
 end
 
-function expand!(arnoldi::ArnoldiDecomp, Pl, Pr::Identity, k::Int, Ax)
+function expand!(arnoldi::ArnoldiDecomp, Pl, Pr::Identity, k::Int, Ax, ns)
     # Expands by Pl \ (A * v) without allocating
     nextV = view(arnoldi.V, :, k + 1)
     mul!(nextV, arnoldi.A, view(arnoldi.V, :, k))
     ldiv!(Pl, nextV)
+    nextV .*= 1. .- ns
 end
 
-function expand!(arnoldi::ArnoldiDecomp, Pl, Pr, k::Int, Ax)
+function expand!(arnoldi::ArnoldiDecomp, Pl, Pr, k::Int, Ax, ns)
     # Expands by Pl \ (A * (Pr \ v)). Avoids allocation by using Ax.
     nextV = view(arnoldi.V, :, k + 1)
     ldiv!(nextV, Pr, view(arnoldi.V, :, k))
     mul!(Ax, arnoldi.A, nextV)
     copyto!(nextV,  Ax)
     ldiv!(Pl, nextV)
+    nextV .*= 1. .- ns
 end
